@@ -50,6 +50,75 @@ def _ch_suffix(channel: int) -> str:
     raise ValueError(f"channel must be 1 or 2, got {channel}")
 
 
+class _LinuxUsbtmcShim:
+    """
+    Minimal pyvisa-MessageBasedResource-compatible adapter for the Linux
+    kernel's `/dev/usbtmc*` character device.
+
+    USBTMC framing is handled in the kernel — each `os.write` is one OUT
+    message and each `os.read` returns exactly one IN message — so the
+    write_termination / read_termination attributes are accepted but not
+    appended.  This avoids having to unbind the kernel driver so libusb
+    (pyvisa-py) can claim the device.
+
+    Permissions: `/dev/usbtmc*` defaults to root-only.  Add a udev rule
+    such as `KERNEL=="usbtmc*", MODE="0660", GROUP="plugdev"` to grant
+    user-level access.
+    """
+
+    # Minimum delay between an OUT (write) and the following IN (read).
+    # The kernel /dev/usbtmc layer does not retry the IN request, so if the
+    # IN poll arrives before the device has queued its response the kernel
+    # will return ETIMEDOUT.  ~50 ms is plenty for the DG1022.
+    _QUERY_DELAY_S = 0.05
+
+    def __init__(self, path: str, timeout_ms: int = 10_000):
+        import os
+        self._fd = os.open(path, os.O_RDWR)
+        self.timeout            = timeout_ms
+        # DG1022 firmware needs a '\n' at the end of each command. The kernel
+        # USBTMC layer handles message framing on the wire, but the device's
+        # SCPI parser still looks for '\n' to mark end-of-command.
+        self.write_termination  = "\n"
+        self.read_termination   = ""
+
+    def write(self, cmd: str) -> None:
+        import os
+        if self.write_termination and not cmd.endswith(self.write_termination):
+            cmd = cmd + self.write_termination
+        os.write(self._fd, cmd.encode("ascii"))
+
+    def read(self) -> str:
+        import os
+        chunk = os.read(self._fd, 4096)
+        return chunk.decode("ascii", errors="replace").rstrip()
+
+    def query(self, cmd: str, delay: float = 0.0) -> str:
+        self.write(cmd)
+        time.sleep(max(delay, self._QUERY_DELAY_S))
+        return self.read()
+
+    def write_binary_values(self, cmd: str, values, datatype: str = "B",
+                            is_big_endian: bool = False,
+                            header_fmt: str = "ieee") -> None:
+        """SCPI definite-length-block binary write (IEEE 488.2 #<n><len><data>)."""
+        import os, struct
+        # Pack values according to datatype
+        fmt = (">" if is_big_endian else "<") + datatype * len(values)
+        data = struct.pack(fmt, *values)
+        n = len(data)
+        n_digits = len(str(n))
+        header = f"{cmd} #{n_digits}{n}".encode("ascii")
+        os.write(self._fd, header + data)
+
+    def close(self) -> None:
+        import os
+        try:
+            os.close(self._fd)
+        except Exception:
+            pass
+
+
 class DG1022Driver:
     """
     Low-level SCPI driver for the Rigol DG1022.
@@ -579,6 +648,21 @@ class DG1022Driver:
     # ------------------------------------------------------------------
 
     def _connect_hardware(self):
+        # Linux USBTMC kernel char-device path (e.g. "/dev/usbtmc0"):
+        # bypass pyvisa, talk to the kernel device directly. Saves having
+        # to unbind the kernel driver so libusb can grab the device.
+        if self._visa_str.startswith("/dev/"):
+            self._inst = _LinuxUsbtmcShim(self._visa_str, timeout_ms=TIMEOUT_MS)
+            self._rm   = None
+            idn = self._inst.query("*IDN?")
+            if IDN_EXPECTED not in idn:
+                self._inst.close()
+                raise RuntimeError(
+                    f"IDN mismatch. Expected {IDN_EXPECTED!r}, got {idn!r}\n"
+                    f"Check device path: {self._visa_str!r}"
+                )
+            return
+
         try:
             import pyvisa
         except ImportError as e:
